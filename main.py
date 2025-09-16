@@ -14,7 +14,6 @@ directory.  Two rendering modes are available:
 from __future__ import annotations
 
 import argparse
-import math
 from pathlib import Path
 from typing import Iterable, Tuple
 
@@ -26,6 +25,9 @@ try:  # Pillow changed the resampling namespace in version 10.0
     _RESAMPLE = Image.Resampling.LANCZOS  # type: ignore[attr-defined]
 except AttributeError:  # pragma: no cover - compatibility branch
     _RESAMPLE = Image.LANCZOS  # type: ignore[assignment]
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
 
 
 SUPPORTED_EXTENSIONS = {
@@ -52,13 +54,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--input-dir",
         type=Path,
-        default=Path("input"),
+        default=SCRIPT_DIR / "input",
         help="Directory containing the images to process.",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("output"),
+        default=SCRIPT_DIR / "output",
         help="Directory where the clustered PNG files are written.",
     )
     parser.add_argument(
@@ -77,8 +79,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--size",
         type=int,
-        default=512,
-        help="Output image size (images are resized to SIZE x SIZE).",
+        default=None,
+        help=(
+            "Output image size (defaults to 512; circle mode renders a 24x24 grid "
+            "upscaled to this size)."
+        ),
     )
     parser.add_argument(
         "--max-iter",
@@ -107,6 +112,12 @@ def ensure_directory(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
+def resolve_runtime_path(path: Path) -> Path:
+    """Return *path* as an absolute path relative to the current working directory."""
+
+    return path if path.is_absolute() else Path.cwd() / path
+
+
 def iter_images(directory: Path) -> Iterable[Path]:
     """Yield all supported image files inside *directory*."""
 
@@ -123,8 +134,8 @@ def load_image(path: Path, size: int) -> Image.Image:
 
     with Image.open(path) as img:
         prepared = ImageOps.exif_transpose(img)
-        fitted = ImageOps.fit(prepared, (size, size), method=_RESAMPLE)
-    return fitted
+        resized = prepared.resize((size, size), resample=_RESAMPLE)
+    return resized
 
 
 def image_to_data(image: Image.Image) -> Tuple[np.ndarray, Tuple[int, int]]:
@@ -187,47 +198,71 @@ def remap_labels(labels: np.ndarray, centroids: np.ndarray) -> Tuple[np.ndarray,
     return remapped, centroids[order]
 
 
+def _cluster_palette(clusters: int) -> np.ndarray:
+    """Return grayscale values for the supported cluster counts."""
+
+    if clusters == 2:
+        return np.array([0, 255], dtype=np.uint8)
+    return np.array([0, 128, 255], dtype=np.uint8)
+
+
 def render_pixel_clusters(label_grid: np.ndarray, clusters: int) -> Image.Image:
     """Convert a label grid to a grayscale output image."""
 
-    if clusters == 2:
-        palette = np.array([0, 255], dtype=np.uint8)
-    else:
-        palette = np.array([0, 128, 255], dtype=np.uint8)
-
+    palette = _cluster_palette(clusters)
     raster = palette[label_grid]
     return Image.fromarray(raster, mode="L")
 
 
-def render_circle_clusters(label_grid: np.ndarray) -> Image.Image:
-    """Draw black circles for each cluster on a white canvas."""
+def render_circle_clusters(
+    label_grid: np.ndarray, clusters: int, output_size: int
+) -> Image.Image:
+    """Draw circular dots for each pixel in the label grid and upscale."""
 
     height, width = label_grid.shape
-    canvas = Image.new("L", (width, height), color=255)
-    draw = ImageDraw.Draw(canvas)
+    palette = _cluster_palette(clusters)
+    draw_palette = palette.copy()
 
-    total = label_grid.size
-    cluster_details = []
-    for label in np.unique(label_grid):
-        coords = np.column_stack(np.where(label_grid == label))
-        if coords.size == 0:
-            continue
-        count = coords.shape[0]
-        center_y, center_x = coords.mean(axis=0)
-        cluster_details.append((count, (float(center_x), float(center_y))))
+    oversample = 4
+    canvas_size = output_size * oversample
+    cell = canvas_size / float(width)
+    base_radius = cell * 0.42
 
-    cluster_details.sort(reverse=True, key=lambda item: item[0])
+    radius_scale = np.ones(len(palette), dtype=np.float32)
+    if clusters == 3:
+        radius_scale = np.array([1.0, 0.55, 0.0], dtype=np.float32)
+        draw_palette[1] = 0  # mid cluster uses smaller black dots
+    else:
+        radius_scale[palette == 255] = 0.0
 
-    for count, (center_x, center_y) in cluster_details:
-        ratio = count / total
-        radius = max(6.0, math.sqrt(ratio) * (min(width, height) / 1.8))
-        left = max(center_x - radius, 0.0)
-        top = max(center_y - radius, 0.0)
-        right = min(center_x + radius, width)
-        bottom = min(center_y + radius, height)
-        draw.ellipse((left, top, right, bottom), fill=0)
+    highres = Image.new("L", (canvas_size, canvas_size), color=255)
+    draw = ImageDraw.Draw(highres)
 
-    return canvas
+    for y in range(height):
+        for x in range(width):
+            label = int(label_grid[y, x])
+            color = int(draw_palette[label])
+            scale = float(radius_scale[label])
+            if scale <= 0.0 or color == 255:
+                continue
+            center_x = (x + 0.5) * cell
+            center_y = (y + 0.5) * cell
+            radius = base_radius * scale
+            bbox = (
+                center_x - radius,
+                center_y - radius,
+                center_x + radius,
+                center_y + radius,
+            )
+            draw.ellipse(bbox, fill=color)
+
+    resized = highres.resize((output_size, output_size), resample=_RESAMPLE)
+    array = np.asarray(resized, dtype=np.int16)
+    unique_values = np.unique(draw_palette).astype(np.int16)
+    palette_values = unique_values[:, None, None]
+    nearest = np.abs(array - palette_values).argmin(axis=0)
+    remapped = unique_values[nearest]
+    return Image.fromarray(remapped.astype(np.uint8), mode="L")
 
 
 def process_image(
@@ -236,14 +271,15 @@ def process_image(
     *,
     mode: str,
     clusters: int,
-    size: int,
+    grid_size: int,
+    output_size: int,
     max_iter: int,
     tol: float,
     seed: int,
 ) -> Path:
     """Cluster a single image and write the PNG result."""
 
-    image = load_image(image_path, size)
+    image = load_image(image_path, grid_size)
     data, (height, width) = image_to_data(image)
     centroids, labels = kmeans(data, clusters, max_iter=max_iter, tol=tol, seed=seed)
     remapped_labels, _ = remap_labels(labels, centroids)
@@ -251,8 +287,10 @@ def process_image(
 
     if mode == "pixel":
         output_image = render_pixel_clusters(label_grid, clusters)
+        if output_size != grid_size:
+            output_image = output_image.resize((output_size, output_size), resample=_RESAMPLE)
     else:
-        output_image = render_circle_clusters(label_grid)
+        output_image = render_circle_clusters(label_grid, clusters, output_size)
 
     output_path = output_dir / f"{image_path.stem}_{mode}_{clusters}.png"
     output_image.save(output_path, format="PNG")
@@ -262,26 +300,41 @@ def process_image(
 def main() -> None:
     args = parse_args()
 
-    ensure_directory(args.input_dir)
-    ensure_directory(args.output_dir)
+    input_dir = resolve_runtime_path(args.input_dir)
+    output_dir = resolve_runtime_path(args.output_dir)
 
-    images = list(iter_images(args.input_dir))
+    if args.mode == "circle":
+        grid_size = 24
+        output_size = args.size if args.size is not None else 512
+    else:
+        output_size = args.size if args.size is not None else 512
+        grid_size = output_size
+
+    ensure_directory(input_dir)
+    ensure_directory(output_dir)
+
+    images = list(iter_images(input_dir))
     if not images:
-        print(f"No supported images found in {args.input_dir.resolve()}")
+        print(f"No supported images found in {input_dir.resolve()}")
         return
 
     for image_path in images:
         result = process_image(
             image_path,
-            args.output_dir,
+            output_dir,
             mode=args.mode,
             clusters=args.clusters,
-            size=args.size,
+            grid_size=grid_size,
+            output_size=output_size,
             max_iter=args.max_iter,
             tol=args.tol,
             seed=args.seed,
         )
-        print(f"Wrote {result.relative_to(Path.cwd())}")
+        try:
+            display_path = result.relative_to(Path.cwd())
+        except ValueError:
+            display_path = result
+        print(f"Wrote {display_path}")
 
 
 if __name__ == "__main__":

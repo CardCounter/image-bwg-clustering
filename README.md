@@ -3,7 +3,9 @@
 Utility script to cluster images into binary or trinary black/white/grey (BWG)
 representations. Images placed in the `input/` directory are clustered with
 either a pixel based renderer or a stylised circular representation and saved
-to the `output/` directory as 512×512 PNG files.
+to the `output/` directory. By default, pixel mode exports 512×512 PNG files,
+while circle mode clusters on a 24×24 grid and renders crisp circular dots that
+are upscaled to 512×512 for easier viewing.
 
 ## Requirements
 
@@ -46,7 +48,8 @@ pip install pillow numpy
 - **Pixel mode**: produces a rasterised image. Binary clustering outputs a black
   and white image, while trinary clustering outputs black, grey, and white
   clusters.
-- **Circle mode**: generates a white canvas with filled black circles whose
-  positions correspond to the cluster centroids. Binary mode draws two circles;
-  trinary mode draws three circles with radii proportional to cluster sizes.
-
+- **Circle mode**: renders each clustered pixel as a circular dot on a white
+  background, producing a stippled look while retaining the original layout.
+  With three clusters, the mid-intensity group uses smaller black dots instead
+  of grey ones. The clustering grid is fixed at 24×24, and the rendered dots are
+  upscaled to a 512×512 output unless you override `--size`.
