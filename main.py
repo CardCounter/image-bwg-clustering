@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""Cluster input images into binary or trinary representations.
+"""Cluster input images into binary, trinary, or quad-tone representations.
 
 The script reads every supported image file from an input directory, clusters
-its pixels into two or three groups and writes a 512x512 PNG to the output
-directory.  Two rendering modes are available:
+its pixels into two, three, or four groups (depending on the mode) and writes
+either an image or a text based
+representation to the output directory. Three rendering modes are available:
 
 * ``pixel`` – generates a black/white (binary) or black/grey/white (trinary)
   raster image based on the cluster labels.
 * ``circle`` – places solid black circles on a white background whose
   positions and sizes are derived from the cluster statistics.
+* ``ascii`` – exports the clustered pixels as ASCII art characters using four
+  tonal levels.
 """
 
 from __future__ import annotations
@@ -47,8 +50,8 @@ def parse_args() -> argparse.Namespace:
 
     parser = argparse.ArgumentParser(
         description=(
-            "Cluster images into binary or trinary representations and save the "
-            "results as 512x512 PNG files."
+            "Cluster images into binary or trinary raster outputs, stylised "
+            "circles, or ASCII art representations."
         )
     )
     parser.add_argument(
@@ -65,24 +68,27 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--mode",
-        choices=["pixel", "circle"],
+        choices=["pixel", "circle", "ascii"],
         default="pixel",
-        help="Rendering mode: pixel cluster map or stylised circles.",
+        help="Rendering mode: pixel cluster map, stylised circles, or ASCII art.",
     )
     parser.add_argument(
         "--clusters",
         type=int,
         choices=[2, 3],
         default=2,
-        help="Number of clusters to compute (binary or trinary).",
+        help=(
+            "Number of clusters to compute for the image renderers (binary or "
+            "trinary). ASCII mode always uses four clusters."
+        ),
     )
     parser.add_argument(
         "--size",
         type=int,
         default=None,
         help=(
-            "Output image size (defaults to 512; circle mode renders a 24x24 grid "
-            "upscaled to this size)."
+            "Output size (defaults to 512 for pixel/circle, 64 for ASCII). Circle "
+            "mode renders a 24x24 grid upscaled to this size."
         ),
     )
     parser.add_argument(
@@ -214,6 +220,22 @@ def render_pixel_clusters(label_grid: np.ndarray, clusters: int) -> Image.Image:
     return Image.fromarray(raster, mode="L")
 
 
+def render_ascii_clusters(label_grid: np.ndarray, clusters: int) -> str:
+    """Convert a label grid to ASCII characters."""
+
+    if clusters == 2:
+        palette = np.array(["#", " "], dtype="<U1")
+    elif clusters == 3:
+        palette = np.array(["#", "*", " "], dtype="<U1")
+    elif clusters == 4:
+        palette = np.array(["@", "#", ":", " "], dtype="<U1")
+    else:
+        raise ValueError("ASCII rendering requires 2, 3, or 4 clusters.")
+
+    ascii_grid = palette[label_grid]
+    return "\n".join("".join(row.tolist()) for row in ascii_grid)
+
+
 def render_circle_clusters(
     label_grid: np.ndarray, clusters: int, output_size: int
 ) -> Image.Image:
@@ -277,7 +299,7 @@ def process_image(
     tol: float,
     seed: int,
 ) -> Path:
-    """Cluster a single image and write the PNG result."""
+    """Cluster a single image and write the rendered result."""
 
     image = load_image(image_path, grid_size)
     data, (height, width) = image_to_data(image)
@@ -289,8 +311,13 @@ def process_image(
         output_image = render_pixel_clusters(label_grid, clusters)
         if output_size != grid_size:
             output_image = output_image.resize((output_size, output_size), resample=_RESAMPLE)
-    else:
+    elif mode == "circle":
         output_image = render_circle_clusters(label_grid, clusters, output_size)
+    else:
+        ascii_art = render_ascii_clusters(label_grid, clusters)
+        output_path = output_dir / f"{image_path.stem}_{mode}_{clusters}.txt"
+        output_path.write_text(ascii_art + "\n", encoding="utf-8")
+        return output_path
 
     output_path = output_dir / f"{image_path.stem}_{mode}_{clusters}.png"
     output_image.save(output_path, format="PNG")
@@ -303,12 +330,21 @@ def main() -> None:
     input_dir = resolve_runtime_path(args.input_dir)
     output_dir = resolve_runtime_path(args.output_dir)
 
+    cluster_count = args.clusters
+
     if args.mode == "circle":
         grid_size = 24
         output_size = args.size if args.size is not None else 512
+    elif args.mode == "ascii":
+        if args.clusters != 2:
+            print("ASCII mode always uses four clusters; ignoring --clusters value.")
+        grid_size = args.size if args.size is not None else 64
+        output_size = grid_size
+        cluster_count = 4
     else:
         output_size = args.size if args.size is not None else 512
         grid_size = output_size
+        cluster_count = args.clusters
 
     ensure_directory(input_dir)
     ensure_directory(output_dir)
@@ -323,7 +359,7 @@ def main() -> None:
             image_path,
             output_dir,
             mode=args.mode,
-            clusters=args.clusters,
+            clusters=cluster_count,
             grid_size=grid_size,
             output_size=output_size,
             max_iter=args.max_iter,
